@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud-Synced Spaghetti Bridge Designer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, deleteDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase 설정 (환경 변수 사용)
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'spaghetti-bridge-shared';
+
+        // 전역 변수 노출
+        window.db = db;
+        window.appId = appId;
+        window.auth = auth;
+
+        // 익명 로그인 실행
+        const initAuth = async () => {
+            try {
+                await signInAnonymously(auth);
+                console.log("Logged in anonymously");
+            } catch (error) {
+                console.error("Auth error:", error);
+            }
+        };
+        initAuth();
+    </script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #f8fafc; font-family: 'Pretendard', sans-serif; }
+        .canvas-container { position: relative; width: 100%; height: 100%; cursor: crosshair; }
+        .view-label { position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.9); padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; pointer-events: none; border: 1px solid #e2e8f0; z-index: 10; }
+        .mode-active { background-color: #2563eb !important; color: white !important; }
+        .grid-view { display: grid; grid-template-columns: 1fr 1.5fr 1fr; grid-template-rows: 1fr 1fr; gap: 4px; height: calc(100vh - 80px); background: #e2e8f0; }
+        .view-3d-main { grid-row: span 2; }
+        .view-box { background: #ffffff; position: relative; overflow: hidden; }
+        .control-panel { height: 80px; background: #ffffff; border-bottom: 2px solid #e2e8f0; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
+        .loading-overlay { position: fixed; inset: 0; background: white; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.5s; }
+    </style>
+</head>
+<body>
+
+    <div id="loader" class="loading-overlay">
+        <div class="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+        <p class="font-bold text-slate-600">클라우드 설계도 불러오는 중...</p>
+    </div>
+
+    <div class="flex flex-col h-screen">
+        <header class="control-panel">
+            <div>
+                <h1 class="text-xl font-black text-slate-900 italic">BRIDGE <span class="text-blue-600">CLOUD</span></h1>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest">실시간 협업 모드 활성화됨</p>
+            </div>
+
+            <div class="flex bg-slate-100 p-1 rounded-xl">
+                <button id="btn-node" class="px-5 py-2 text-xs font-bold rounded-lg mode-active" onclick="setMode('node')">점 생성</button>
+                <button id="btn-edge" class="px-5 py-2 text-xs font-bold rounded-lg text-slate-500" onclick="setMode('edge')">연결</button>
+                <button id="btn-delete" class="px-5 py-2 text-xs font-bold rounded-lg text-slate-500" onclick="setMode('delete')">삭제</button>
+            </div>
+
+            <div class="flex items-center gap-4">
+                <div class="text-right mr-4">
+                    <div class="text-[10px] text-slate-400 font-bold uppercase">Cloud Storage</div>
+                    <div class="text-xs font-bold text-emerald-600 flex items-center gap-1">
+                        <span class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span> 동기화 중
+                    </div>
+                </div>
+                <button onclick="clearCloudData()" class="px-4 py-2 border border-red-200 text-red-500 rounded-xl text-xs font-bold hover:bg-red-50">전체 초기화</button>
+            </div>
+        </header>
+
+        <main class="grid-view">
+            <div class="view-box"><div class="view-label">Top (X/Z)</div><div id="container-top" class="canvas-container"></div></div>
+            <div class="view-box view-3d-main"><div id="container-3d" class="canvas-container"></div></div>
+            <div class="view-box"><div class="view-label">Front (X/Y)</div><div id="container-front" class="canvas-container"></div></div>
+            <div class="view-box"><div class="view-label">Bottom (X/Z)</div><div id="container-bottom" class="canvas-container"></div></div>
+            <div class="view-box"><div class="view-label">Right (Z/Y)</div><div id="container-right" class="canvas-container"></div></div>
+        </main>
+    </div>
+
+    <script type="module">
+        import { doc, setDoc, onSnapshot, collection, deleteDoc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        let scene3d, camera3d, renderer3d, controls3d;
+        let views = { top: {}, front: {}, right: {}, bottom: {} };
+        let nodes = [], edges = [];
+        let mode = 'node';
+        let selectedNode = null;
+        const SIDE_DEPTH = 4;
+        const BRIDGE_L = 30;
+
+        // --- Core Logic ---
+
+        window.setMode = (m) => {
+            mode = m;
+            document.querySelectorAll('button[id^="btn-"]').forEach(b => b.classList.remove('mode-active', 'text-slate-500'));
+            document.getElementById('btn-' + m).classList.add('mode-active');
+            if(selectedNode) highlightNode(selectedNode, false);
+            selectedNode = null;
+        }
+
+        async function saveNode(x, y, z, fixed = false) {
+            const id = `node_${x}_${y}_${z}`;
+            const nodeRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'nodes', id);
+            await setDoc(nodeRef, { x, y, z, fixed, id });
+        }
+
+        async function saveEdge(n1Id, n2Id) {
+            const id = [n1Id, n2Id].sort().join('_');
+            const edgeRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'edges', id);
+            await setDoc(edgeRef, { n1Id, n2Id, id });
+        }
+
+        window.clearCloudData = async () => {
+            if(!confirm("모든 데이터를 삭제할까요?")) return;
+            nodes.forEach(async n => {
+                if(!n.fixed) await deleteDoc(doc(window.db, 'artifacts', window.appId, 'public', 'data', 'nodes', n.id));
+            });
+            edges.forEach(async e => {
+                await deleteDoc(doc(window.db, 'artifacts', window.appId, 'public', 'data', 'edges', e.id));
+            });
+        }
+
+        // --- Firebase Listeners ---
+
+        function setupSync() {
+            // 노드 동기화
+            const nodesCol = collection(window.db, 'artifacts', window.appId, 'public', 'data', 'nodes');
+            onSnapshot(nodesCol, (snapshot) => {
+                const currentIds = snapshot.docs.map(d => d.id);
+                // 삭제된 노드 처리
+                nodes.filter(n => !currentIds.includes(n.id)).forEach(n => removeNodeLocally(n));
+                // 추가된 노드 처리
+                snapshot.docChanges().forEach(change => {
+                    if (change.type === "added" || change.type === "modified") {
+                        const data = change.doc.data();
+                        addNodeLocally(data.x, data.y, data.z, data.fixed, data.id);
+                    }
+                });
+                document.getElementById('loader').style.opacity = '0';
+                setTimeout(() => document.getElementById('loader').style.display = 'none', 500);
+            }, (err) => console.error(err));
+
+            // 엣지 동기화
+            const edgesCol = collection(window.db, 'artifacts', window.appId, 'public', 'data', 'edges');
+            onSnapshot(edgesCol, (snapshot) => {
+                const currentIds = snapshot.docs.map(d => d.id);
+                edges.filter(e => !currentIds.includes(e.id)).forEach(e => removeEdgeLocally(e));
+                snapshot.docChanges().forEach(change => {
+                    if (change.type === "added") {
+                        const data = change.doc.data();
+                        addEdgeLocally(data.n1Id, data.n2Id, data.id);
+                    }
+                });
+            }, (err) => console.error(err));
+        }
+
+        // --- Local View Rendering ---
+
+        function addNodeLocally(x, y, z, fixed, id) {
+            if(nodes.find(n => n.id === id)) return;
+            const node = { id, x, y, z, fixed, meshes: {} };
+            ['top', 'front', 'right', 'bottom', '3d'].forEach(vId => {
+                const mat = new THREE.MeshPhongMaterial({ color: fixed ? 0x64748b : 0x334155 });
+                const mesh = new THREE.Mesh(new THREE.SphereGeometry(vId === '3d' ? 0.35 : 0.5), mat);
+                mesh.position.set(x, y, z);
+                if(vId === '3d') scene3d.add(mesh);
+                else views[vId].scene.add(mesh);
+                node.meshes[vId] = mesh;
+            });
+            nodes.push(node);
+        }
+
+        function removeNodeLocally(node) {
+            Object.values(node.meshes).forEach(m => m.parent && m.parent.remove(m));
+            nodes = nodes.filter(n => n !== node);
+        }
+
+        function addEdgeLocally(n1Id, n2Id, id) {
+            if(edges.find(e => e.id === id)) return;
+            const n1 = nodes.find(n => n.id === n1Id);
+            const n2 = nodes.find(n => n.id === n2Id);
+            if(!n1 || !n2) return;
+
+            const edge = { id, n1, n2, meshes: {} };
+            ['top', 'front', 'right', 'bottom', '3d'].forEach(vId => {
+                const mat = new THREE.MeshPhongMaterial({ color: 0x3b82f6 });
+                const mesh = createCylinderMesh(n1, n2, vId === '3d' ? 0.12 : 0.18, mat);
+                if(vId === '3d') scene3d.add(mesh);
+                else views[vId].scene.add(mesh);
+                edge.meshes[vId] = mesh;
+            });
+            edges.push(edge);
+        }
+
+        function removeEdgeLocally(edge) {
+            Object.values(edge.meshes).forEach(m => m.parent && m.parent.remove(m));
+            edges = edges.filter(e => e !== edge);
+        }
+
+        function createCylinderMesh(n1, n2, radius, material) {
+            const p1 = new THREE.Vector3(n1.x, n1.y, n1.z);
+            const p2 = new THREE.Vector3(n2.x, n2.y, n2.z);
+            const dist = p1.distanceTo(p2);
+            const mesh = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, dist, 6), material);
+            mesh.position.copy(p1.clone().lerp(p2, 0.5));
+            mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), p2.clone().sub(p1).normalize());
+            return mesh;
+        }
+
+        function highlightNode(node, active) {
+            const color = node.fixed ? 0x64748b : (active ? 0x2563eb : 0x334155);
+            Object.values(node.meshes).forEach(m => m.material.color.setHex(color));
+        }
+
+        // --- Viewport Setup ---
+
+        function init() {
+            init3D();
+            init2DView('top', new THREE.Vector3(0, 50, 0));
+            init2DView('front', new THREE.Vector3(0, 0, 50));
+            init2DView('right', new THREE.Vector3(50, 0, 0));
+            init2DView('bottom', new THREE.Vector3(0, -50, 0));
+            
+            // 초기 고정 노드 (서버에 없으면 생성)
+            setTimeout(() => {
+                const corners = [
+                    [-BRIDGE_L/2, 0, SIDE_DEPTH], [BRIDGE_L/2, 0, SIDE_DEPTH],
+                    [-BRIDGE_L/2, 0, -SIDE_DEPTH], [BRIDGE_L/2, 0, -SIDE_DEPTH]
+                ];
+                corners.forEach(c => saveNode(c[0], c[1], c[2], true));
+                setupSync();
+            }, 1000);
+
+            animate();
+        }
+
+        function init3D() {
+            const container = document.getElementById('container-3d');
+            scene3d = new THREE.Scene();
+            scene3d.background = new THREE.Color(0xf1f5f9);
+            camera3d = new THREE.PerspectiveCamera(40, container.clientWidth / container.clientHeight, 0.1, 1000);
+            camera3d.position.set(35, 25, 35);
+            renderer3d = new THREE.WebGLRenderer({ antialias: true });
+            renderer3d.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer3d.domElement);
+            controls3d = new THREE.OrbitControls(camera3d, renderer3d.domElement);
+            scene3d.add(new THREE.AmbientLight(0xffffff, 0.8));
+            scene3d.add(new THREE.GridHelper(60, 30, 0xcbd5e1, 0xe2e8f0));
+        }
+
+        function init2DView(id, pos) {
+            const container = document.getElementById('container-' + id);
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xffffff);
+            const size = 20;
+            const aspect = container.clientWidth / container.clientHeight;
+            const camera = new THREE.OrthographicCamera(-size * aspect, size * aspect, size, -size, 0.1, 1000);
+            camera.position.copy(pos);
+            camera.lookAt(0, 0, 0);
+            const renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+            
+            const grid = new THREE.GridHelper(60, 30, 0xe2e8f0, 0xf1f5f9);
+            if(id === 'top' || id === 'bottom') grid.rotation.x = 0;
+            else if(id === 'front') grid.rotation.x = Math.PI/2;
+            else if(id === 'right') grid.rotation.z = Math.PI/2;
+            scene.add(grid);
+
+            views[id] = { scene, camera, renderer };
+            renderer.domElement.addEventListener('mousedown', (e) => handleInteraction(e, id));
+        }
+
+        function getMousePos(event, viewId) {
+            const target = views[viewId];
+            const rect = target.renderer.domElement.getBoundingClientRect();
+            const mouse = new THREE.Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(mouse, target.camera);
+            
+            let plane;
+            if (viewId === 'top' || viewId === 'bottom') plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+            else if (viewId === 'front') plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+            else if (viewId === 'right') plane = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+            
+            const pos = new THREE.Vector3();
+            if (raycaster.ray.intersectPlane(plane, pos)) return pos;
+            return null;
+        }
+
+        function handleInteraction(event, viewId) {
+            const target = views[viewId];
+            const rect = target.renderer.domElement.getBoundingClientRect();
+            const mouse = new THREE.Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(mouse, target.camera);
+
+            const nodeMeshes = nodes.map(n => n.meshes[viewId]);
+            const intersects = raycaster.intersectObjects(nodeMeshes);
+
+            if (mode === 'node') {
+                const pos = getMousePos(event, viewId);
+                if (pos) {
+                    const gx = Math.round(pos.x), gy = Math.max(0, Math.round(pos.y)), gz = Math.round(pos.z);
+                    // 대칭 점 저장
+                    saveNode(gx, gy, gz);
+                    saveNode(-gx, gy, gz);
+                    saveNode(gx, gy, -gz);
+                    saveNode(-gx, gy, -gz);
+                }
+            } else if (mode === 'edge') {
+                if (intersects.length > 0) {
+                    const clickedNode = nodes.find(n => n.meshes[viewId] === intersects[0].object);
+                    if (!selectedNode) {
+                        selectedNode = clickedNode;
+                        highlightNode(selectedNode, true);
+                    } else {
+                        if (selectedNode !== clickedNode) {
+                            const n1 = selectedNode, n2 = clickedNode;
+                            saveEdge(n1.id, n2.id);
+                            
+                            // 대칭 부재 저장
+                            const n1Z = nodes.find(n => n.x === n1.x && n.z === -n1.z && n.y === n1.y);
+                            const n2Z = nodes.find(n => n.x === n2.x && n.z === -n2.z && n.y === n2.y);
+                            if(n1Z && n2Z) saveEdge(n1Z.id, n2Z.id);
+
+                            const n1X = nodes.find(n => n.x === -n1.x && n.z === n1.z && n.y === n1.y);
+                            const n2X = nodes.find(n => n.x === -n2.x && n.z === n2.z && n.y === n2.y);
+                            if(n1X && n2X) saveEdge(n1X.id, n2X.id);
+                        }
+                        highlightNode(selectedNode, false);
+                        selectedNode = null;
+                    }
+                }
+            } else if (mode === 'delete') {
+                if (intersects.length > 0) {
+                    const node = nodes.find(n => n.meshes[viewId] === intersects[0].object);
+                    if (!node.fixed) deleteDoc(doc(window.db, 'artifacts', window.appId, 'public', 'data', 'nodes', node.id));
+                }
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls3d.update();
+            renderer3d.render(scene3d, camera3d);
+            Object.values(views).forEach(v => v.renderer && v.renderer.render(v.scene, v.camera));
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
